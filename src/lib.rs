@@ -51,7 +51,7 @@ use std::{
     ops::Deref,
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
 };
@@ -110,20 +110,22 @@ impl<'a, K, V> From<Job<'a, K, V>> for Option<Guard<'a, K, V>> {
 
 /// An interface for outsourcing work to other threads
 pub struct Outsourcer<K, V, F> {
-    set: Arc<Set<K>>,
-    map: Arc<Map<K, V>>,
+    locks: Arc<Map<K, Arc<Mutex<()>>>>,
+    in_progress: Arc<Set<K>>,
+    finished: Arc<Map<K, V>>,
     f: Arc<F>,
-    pending: Arc<AtomicUsize>,
+    in_progress_len: Arc<AtomicUsize>,
 }
 
 impl<K, V, F> Outsourcer<K, V, F> {
     /// Create a new `Outsourcer` with the given function
     pub fn new(f: F) -> Self {
         Outsourcer {
-            set: Arc::new(Set::new()),
-            map: Arc::new(Map::new()),
+            locks: Arc::new(Map::new()),
+            in_progress: Arc::new(Set::new()),
+            finished: Arc::new(Map::new()),
             f: Arc::new(f),
-            pending: Arc::new(AtomicUsize::new(0)),
+            in_progress_len: Arc::new(AtomicUsize::new(0)),
         }
     }
     /// Get the job with the given input
@@ -132,12 +134,36 @@ impl<K, V, F> Outsourcer<K, V, F> {
         Q: Hash + Ord,
         K: Borrow<Q>,
     {
-        if self.set.contains(input) {
+        if self.in_progress.contains(input) {
             Job::InProgress
-        } else if let Some(rg) = self.map.get(input) {
+        } else if let Some(rg) = self.finished.get(input) {
             Job::Finished(Guard(rg))
         } else {
             Job::None
+        }
+    }
+    /// Wait for a job to finish and get its result
+    ///
+    /// Returns `None` if a job with the given input does not exist
+    pub fn wait_for<'a, Q>(&'a self, input: &Q) -> Option<Guard<'a, K, V>>
+    where
+        Q: Hash + Ord,
+        K: Borrow<Q>,
+    {
+        if let Some(rg) = self.locks.get(input) {
+            loop {
+                let done_guard = rg.val().lock().expect("Progress lock poisoned");
+                if let Some(res) = self.get(input).finished() {
+                    println!("finished");
+                    drop(done_guard);
+                    break Some(res);
+                } else {
+                    drop(done_guard);
+                    println!("not finished");
+                }
+            }
+        } else {
+            None
         }
     }
     /// Check if the job with the given input has finished
@@ -150,7 +176,7 @@ impl<K, V, F> Outsourcer<K, V, F> {
     }
     /// Check the number of jobs that are in progress
     pub fn in_progress_len(&self) -> usize {
-        self.pending.load(AtomicOrdering::Relaxed)
+        self.in_progress_len.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -161,17 +187,32 @@ where
     F: Fn(K) -> V + Send + Sync + 'static,
 {
     fn _start(&self, input: K) {
-        let _ = self.set.insert(input.clone());
-        self.pending.fetch_add(1, AtomicOrdering::Relaxed);
-        let map = Arc::clone(&self.map);
-        let set = Arc::clone(&self.set);
+        // Create lock
+        let done_lock = Arc::new(Mutex::new(()));
+        self.locks.insert(input.clone(), Arc::clone(&done_lock));
+        // Add job to in_progress
+        let _ = self.in_progress.insert(input.clone());
+        // Increment in_progress_len
+        self.in_progress_len.fetch_add(1, AtomicOrdering::Relaxed);
+        // Clone Arcs for job thread
+        let finished = Arc::clone(&self.finished);
+        let in_progress = Arc::clone(&self.in_progress);
         let f = Arc::clone(&self.f);
-        let pending = Arc::clone(&self.pending);
+        let in_progress_len = Arc::clone(&self.in_progress_len);
+        // Spawn job thread
         thread::spawn(move || {
+            // Lock until done
+            let done_guard = done_lock.lock().expect("Progress lock poisoned");
+            // Do work
             let res = f(input.clone());
-            set.remove(&input);
-            pending.fetch_sub(1, AtomicOrdering::Relaxed);
-            map.insert(input, res);
+            // Remove job from in_progress
+            in_progress.remove(&input);
+            // Decrement in_progress_len
+            in_progress_len.fetch_sub(1, AtomicOrdering::Relaxed);
+            // Add result to finished
+            finished.insert(input, res);
+            // Unlock
+            drop(done_guard);
         });
     }
     /**
@@ -234,7 +275,7 @@ impl<K, V, F> fmt::Debug for Outsourcer<K, V, F> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Outsourcer")
             .field("in progress", &self.in_progress_len())
-            .field("finished", &self.map)
+            .field("finished", &self.finished)
             .finish()
     }
 }
@@ -282,5 +323,24 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         <V as fmt::Display>::fmt(self, f)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn wait_for() {
+        let outsourcer = Outsourcer::new(|i| {
+            thread::sleep(Duration::from_millis(200));
+            2 * i + 1
+        });
+        outsourcer.start(1);
+        outsourcer.start(2);
+        outsourcer.start(3);
+        assert_eq!(outsourcer.wait_for(&1).unwrap(), 3);
+        assert_eq!(outsourcer.wait_for(&2).unwrap(), 5);
+        assert_eq!(outsourcer.wait_for(&3).unwrap(), 7);
     }
 }
