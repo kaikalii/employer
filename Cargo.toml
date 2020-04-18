@@ -3,7 +3,20 @@ lockfree = '0.5.1'
 
 [package]
 authors = ['Kai Schmidt <kaikaliischmidt@gmail.com>']
+categories = [
+    'asynchronous',
+    'concurrency',
+    'data-structures',
+]
+docs = 'docs.rs/outsource'
 edition = '2018'
+homepage = 'https://github.com/kaikalii/outsource'
+keywords = [
+    'thread',
+    'work',
+    'schedule',
+]
+license = 'MIT'
 name = 'outsource'
+readme = 'readme.md'
 version = '0.1.0'
-readme = "readme.md"
