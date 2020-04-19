@@ -190,6 +190,15 @@ pub struct Outsourcer<K, V, D> {
     in_progress_len: Arc<AtomicUsize>,
 }
 
+impl<K, V, D> Default for Outsourcer<K, V, D>
+where
+    D: Default,
+{
+    fn default() -> Self {
+        Outsourcer::new(D::default())
+    }
+}
+
 impl<K, V, D> Outsourcer<K, V, D> {
     /// Create a new `Outsourcer` with the given function
     pub fn new(description: D) -> Self {
