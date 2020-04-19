@@ -57,8 +57,8 @@ use std::{
 };
 
 use lockfree::{
-    map::{Map, ReadGuard},
-    set::Set,
+    map::{self, Map},
+    set::{self, Set},
 };
 
 /**
@@ -135,12 +135,25 @@ pub enum Job<'a, K, V> {
     /// The job is in progress
     InProgress,
     /// The job has finished
-    Finished(Guard<'a, K, V>),
+    Finished(OutputGuard<'a, K, V>),
 }
 
 impl<'a, K, V> Default for Job<'a, K, V> {
     fn default() -> Self {
         Job::None
+    }
+}
+
+impl<'a, K, V> fmt::Debug for Job<'a, K, V>
+where
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Job::None => write!(f, "None"),
+            Job::InProgress => write!(f, "InProgress"),
+            Job::Finished(g) => g.fmt(f),
+        }
     }
 }
 
@@ -158,15 +171,15 @@ impl<'a, K, V> Job<'a, K, V> {
         !matches!(self, Job::None)
     }
     /// Get a reference to the result of the `Job` if is is finished
-    pub fn as_finished(&self) -> Option<&Guard<'a, K, V>> {
+    pub fn as_finished(&self) -> Option<&OutputGuard<'a, K, V>> {
         if let Job::Finished(job) = self {
             Some(job)
         } else {
             None
         }
     }
-    /// Convert the `Job` to an `Option<Guard>`
-    pub fn finished(self) -> Option<Guard<'a, K, V>> {
+    /// Convert the `Job` to an `Option<OutputGuard>`
+    pub fn finished(self) -> Option<OutputGuard<'a, K, V>> {
         if let Job::Finished(job) = self {
             Some(job)
         } else {
@@ -175,7 +188,7 @@ impl<'a, K, V> Job<'a, K, V> {
     }
 }
 
-impl<'a, K, V> From<Job<'a, K, V>> for Option<Guard<'a, K, V>> {
+impl<'a, K, V> From<Job<'a, K, V>> for Option<OutputGuard<'a, K, V>> {
     fn from(job: Job<'a, K, V>) -> Self {
         job.finished()
     }
@@ -188,15 +201,7 @@ pub struct Outsourcer<K, V, D> {
     finished: Arc<Map<K, V>>,
     desc: Arc<D>,
     in_progress_len: Arc<AtomicUsize>,
-}
-
-impl<K, V, D> Default for Outsourcer<K, V, D>
-where
-    D: Default,
-{
-    fn default() -> Self {
-        Outsourcer::new(D::default())
-    }
+    finished_len: Arc<AtomicUsize>,
 }
 
 impl<K, V, D> Outsourcer<K, V, D> {
@@ -208,6 +213,7 @@ impl<K, V, D> Outsourcer<K, V, D> {
             finished: Arc::new(Map::new()),
             desc: Arc::new(description),
             in_progress_len: Arc::new(AtomicUsize::new(0)),
+            finished_len: Arc::new(AtomicUsize::new(0)),
         }
     }
     /// Get the job with the given input
@@ -219,7 +225,7 @@ impl<K, V, D> Outsourcer<K, V, D> {
         if self.in_progress.contains(input) {
             Job::InProgress
         } else if let Some(rg) = self.finished.get(input) {
-            Job::Finished(Guard(rg))
+            Job::Finished(OutputGuard(rg))
         } else {
             Job::None
         }
@@ -227,7 +233,7 @@ impl<K, V, D> Outsourcer<K, V, D> {
     /// Wait for a job to finish and get its result
     ///
     /// Returns `None` if a job with the given input does not exist
-    pub fn wait_for<'a, Q>(&'a self, input: &Q) -> Option<Guard<'a, K, V>>
+    pub fn wait_for<'a, Q>(&'a self, input: &Q) -> Option<OutputGuard<'a, K, V>>
     where
         Q: Hash + Ord,
         K: Borrow<Q>,
@@ -260,6 +266,30 @@ impl<K, V, D> Outsourcer<K, V, D> {
     pub fn in_progress_len(&self) -> usize {
         self.in_progress_len.load(AtomicOrdering::Relaxed)
     }
+    /// Iterate over finished job input/output pairs
+    pub fn finished_iter(&self) -> JobIter<K, V> {
+        self.finished.iter()
+    }
+    /// Iterate over in_progress job inputs
+    pub fn in_progress_inputs(&self) -> impl Iterator<Item = InputGuard<K, V>> {
+        self.in_progress
+            .iter()
+            .map(|g| InputGuard(InputGuardInner::Set(g)))
+    }
+    /// Iterate over finished job inputs
+    pub fn finished_inputs(&self) -> impl Iterator<Item = InputGuard<K, V>> {
+        self.finished
+            .iter()
+            .map(|g| InputGuard(InputGuardInner::Map(g)))
+    }
+    /// Iterate over all job inputs
+    pub fn inputs(&self) -> impl Iterator<Item = InputGuard<K, V>> {
+        self.finished_inputs().chain(self.in_progress_inputs())
+    }
+    /// Iterate over finished job outputs
+    pub fn outputs(&self) -> impl Iterator<Item = OutputGuard<K, V>> {
+        self.finished.iter().map(OutputGuard)
+    }
 }
 
 impl<K, V, D> Outsourcer<K, V, D>
@@ -281,6 +311,7 @@ where
         let in_progress = Arc::clone(&self.in_progress);
         let desc = Arc::clone(&self.desc);
         let in_progress_len = Arc::clone(&self.in_progress_len);
+        let finished_len = Arc::clone(&self.finished_len);
         // Spawn job thread
         thread::spawn(move || {
             // Lock until done
@@ -291,6 +322,8 @@ where
             in_progress.remove(&input);
             // Decrement in_progress_len
             in_progress_len.fetch_sub(1, AtomicOrdering::Relaxed);
+            // Increment finished_len
+            finished_len.fetch_add(1, AtomicOrdering::Relaxed);
             // Add result to finished
             finished.insert(input, res);
             // Unlock
@@ -362,17 +395,51 @@ impl<K, V, D> fmt::Debug for Outsourcer<K, V, D> {
     }
 }
 
-/// A guard to the result of a finished job
-pub struct Guard<'a, K, V>(ReadGuard<'a, K, V>);
+impl<K, V, D> Default for Outsourcer<K, V, D>
+where
+    D: Default,
+{
+    fn default() -> Self {
+        Outsourcer::new(D::default())
+    }
+}
 
-impl<'a, K, V> Deref for Guard<'a, K, V> {
+impl<K, V, D> From<Outsourcer<K, V, D>> for Arc<D> {
+    fn from(outsourcer: Outsourcer<K, V, D>) -> Self {
+        outsourcer.desc
+    }
+}
+
+impl<K, V, D> From<D> for Outsourcer<K, V, D> {
+    fn from(desc: D) -> Self {
+        Outsourcer::new(desc)
+    }
+}
+
+/// A guard to finished job input/output pairs
+pub type JobGuard<'a, K, V> = lockfree::map::ReadGuard<'a, K, V>;
+/// An iterator over guards to finished job input/output pairs
+pub type JobIter<'a, K, V> = lockfree::map::Iter<'a, K, V>;
+
+impl<'a, K, V, H> IntoIterator for &'a Outsourcer<K, V, H> {
+    type Item = JobGuard<'a, K, V>;
+    type IntoIter = JobIter<'a, K, V>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.finished.iter()
+    }
+}
+
+/// A guard to the result of a finished job
+pub struct OutputGuard<'a, K, V>(map::ReadGuard<'a, K, V>);
+
+impl<'a, K, V> Deref for OutputGuard<'a, K, V> {
     type Target = V;
     fn deref(&self) -> &Self::Target {
         self.0.val()
     }
 }
 
-impl<'a, K, V, T> PartialEq<T> for Guard<'a, K, V>
+impl<'a, K, V, T> PartialEq<T> for OutputGuard<'a, K, V>
 where
     V: PartialEq<T>,
 {
@@ -381,7 +448,7 @@ where
     }
 }
 
-impl<'a, K, V, T> PartialOrd<T> for Guard<'a, K, V>
+impl<'a, K, V, T> PartialOrd<T> for OutputGuard<'a, K, V>
 where
     V: PartialOrd<T>,
 {
@@ -390,7 +457,7 @@ where
     }
 }
 
-impl<'a, K, V> fmt::Debug for Guard<'a, K, V>
+impl<'a, K, V> fmt::Debug for OutputGuard<'a, K, V>
 where
     V: fmt::Debug,
 {
@@ -399,12 +466,66 @@ where
     }
 }
 
-impl<'a, K, V> fmt::Display for Guard<'a, K, V>
+impl<'a, K, V> fmt::Display for OutputGuard<'a, K, V>
 where
     V: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         <V as fmt::Display>::fmt(self, f)
+    }
+}
+
+enum InputGuardInner<'a, K, V> {
+    Map(map::ReadGuard<'a, K, V>),
+    Set(set::ReadGuard<'a, K>),
+}
+
+/// A guard to the input of a job
+pub struct InputGuard<'a, K, V>(InputGuardInner<'a, K, V>);
+
+impl<'a, K, V> Deref for InputGuard<'a, K, V> {
+    type Target = K;
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            InputGuardInner::Map(g) => g.key(),
+            InputGuardInner::Set(g) => &*g,
+        }
+    }
+}
+
+impl<'a, K, V, T> PartialEq<T> for InputGuard<'a, K, V>
+where
+    K: PartialEq<T>,
+{
+    fn eq(&self, other: &T) -> bool {
+        (**self).eq(other)
+    }
+}
+
+impl<'a, K, V, T> PartialOrd<T> for InputGuard<'a, K, V>
+where
+    K: PartialOrd<T>,
+{
+    fn partial_cmp(&self, other: &T) -> Option<CmpOrdering> {
+        (**self).partial_cmp(other)
+    }
+}
+
+impl<'a, K, V> fmt::Debug for InputGuard<'a, K, V>
+where
+    K: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        <K as fmt::Debug>::fmt(self, f)
+    }
+}
+
+impl<'a, K, V> fmt::Display for InputGuard<'a, K, V>
+where
+    K: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        <K as fmt::Display>::fmt(self, f)
     }
 }
 
