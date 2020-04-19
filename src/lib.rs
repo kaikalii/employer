@@ -61,7 +61,45 @@ use lockfree::{
     set::Set,
 };
 
-/// A decscription of a job
+/**
+A description of a job
+
+This trait defines work to be done through an
+[`Outsourcer`](struct.Outsourcer.html).
+This crate provides two implementations. A stateless one,
+and a stateful one.
+
+### Stateless Example
+
+`JobDescription<I, Output = O>` is emplemented for all
+`F` where `F: Fn(I) -> O + Send + Sync`. This is the basic
+stateless implementation.
+```
+use outsource::*;
+
+let outsourcer = Outsourcer::new(|i| i + 1); // No state, just a function
+
+outsourcer.start(1);
+
+assert_eq!(outsourcer.wait_for(&1).unwrap(), 2);
+```
+
+### Stateful Example
+
+`JobDescription<I, Output = O>` is emplemented for all
+`(S, F)` where `F: Fn(I) -> O + Send + Sync, S: Send + Sync`.
+This is the basic stateful implementation.
+
+```
+use outsource::*;
+
+let outsourcer = Outsourcer::new((3, |i, state: &i32| i + *state)); // A state and a function
+
+outsourcer.start(1);
+
+assert_eq!(outsourcer.wait_for(&1).unwrap(), 4);
+```
+*/
 pub trait JobDescription<I>: Send + Sync {
     /// The job output type
     type Output;
@@ -144,11 +182,11 @@ impl<'a, K, V> From<Job<'a, K, V>> for Option<Guard<'a, K, V>> {
 }
 
 /// An interface for outsourcing work to other threads
-pub struct Outsourcer<K, V, F> {
+pub struct Outsourcer<K, V, D> {
     locks: Arc<Map<K, Arc<Mutex<()>>>>,
     in_progress: Arc<Set<K>>,
     finished: Arc<Map<K, V>>,
-    desc: Arc<F>,
+    desc: Arc<D>,
     in_progress_len: Arc<AtomicUsize>,
 }
 
@@ -377,5 +415,11 @@ mod test {
         assert_eq!(outsourcer.wait_for(&1).unwrap(), 3);
         assert_eq!(outsourcer.wait_for(&2).unwrap(), 5);
         assert_eq!(outsourcer.wait_for(&3).unwrap(), 7);
+    }
+    #[test]
+    fn state() {
+        let outsourcer = Outsourcer::new((3, |i, state: &i32| i + *state));
+        outsourcer.start(1);
+        assert_eq!(outsourcer.wait_for(&1).unwrap(), 4);
     }
 }
