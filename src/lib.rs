@@ -266,6 +266,10 @@ impl<K, V, D> Outsourcer<K, V, D> {
     pub fn in_progress_len(&self) -> usize {
         self.in_progress_len.load(AtomicOrdering::Relaxed)
     }
+    /// Check the number of jobs that are in progress
+    pub fn finished_len(&self) -> usize {
+        self.finished_len.load(AtomicOrdering::Relaxed)
+    }
     /// Iterate over finished job input/output pairs
     pub fn finished_iter(&self) -> JobIter<K, V> {
         self.finished.iter()
@@ -382,6 +386,17 @@ where
         };
         if restart {
             self._start(input)
+        }
+    }
+    /// Remove a finished job with the given input
+    pub fn remove<Q>(&self, input: &Q)
+    where
+        Q: Hash + Ord,
+        K: Borrow<Q>,
+    {
+        if self.finished.remove(input).is_some() {
+            self.locks.remove(input);
+            self.finished_len.fetch_sub(1, AtomicOrdering::Relaxed);
         }
     }
 }
