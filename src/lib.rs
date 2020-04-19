@@ -61,6 +61,35 @@ use lockfree::{
     set::Set,
 };
 
+/// A decscription of a job
+pub trait JobDescription<I>: Send + Sync {
+    /// The job output type
+    type Output;
+    /// Do the job
+    fn work(&self, input: I) -> Self::Output;
+}
+
+impl<F, I, O> JobDescription<I> for F
+where
+    F: Fn(I) -> O + Send + Sync,
+{
+    type Output = O;
+    fn work(&self, input: I) -> Self::Output {
+        self(input)
+    }
+}
+
+impl<'a, F, I, O, S> JobDescription<I> for (S, F)
+where
+    F: Fn(I, &S) -> O + Send + Sync,
+    S: Send + Sync,
+{
+    type Output = O;
+    fn work(&self, input: I) -> Self::Output {
+        (self.1)(input, &self.0)
+    }
+}
+
 /// The status of a job
 pub enum Job<'a, K, V> {
     /// No job exists with the given input
@@ -69,6 +98,12 @@ pub enum Job<'a, K, V> {
     InProgress,
     /// The job has finished
     Finished(Guard<'a, K, V>),
+}
+
+impl<'a, K, V> Default for Job<'a, K, V> {
+    fn default() -> Self {
+        Job::None
+    }
 }
 
 impl<'a, K, V> Job<'a, K, V> {
@@ -113,18 +148,18 @@ pub struct Outsourcer<K, V, F> {
     locks: Arc<Map<K, Arc<Mutex<()>>>>,
     in_progress: Arc<Set<K>>,
     finished: Arc<Map<K, V>>,
-    f: Arc<F>,
+    desc: Arc<F>,
     in_progress_len: Arc<AtomicUsize>,
 }
 
-impl<K, V, F> Outsourcer<K, V, F> {
+impl<K, V, D> Outsourcer<K, V, D> {
     /// Create a new `Outsourcer` with the given function
-    pub fn new(f: F) -> Self {
+    pub fn new(description: D) -> Self {
         Outsourcer {
             locks: Arc::new(Map::new()),
             in_progress: Arc::new(Set::new()),
             finished: Arc::new(Map::new()),
-            f: Arc::new(f),
+            desc: Arc::new(description),
             in_progress_len: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -180,11 +215,11 @@ impl<K, V, F> Outsourcer<K, V, F> {
     }
 }
 
-impl<K, V, F> Outsourcer<K, V, F>
+impl<K, V, D> Outsourcer<K, V, D>
 where
     K: Ord + Hash + Clone + Send + Sync + 'static,
     V: Send + Sync + 'static,
-    F: Fn(K) -> V + Send + Sync + 'static,
+    D: JobDescription<K, Output = V> + 'static,
 {
     fn _start(&self, input: K) {
         // Create lock
@@ -197,14 +232,14 @@ where
         // Clone Arcs for job thread
         let finished = Arc::clone(&self.finished);
         let in_progress = Arc::clone(&self.in_progress);
-        let f = Arc::clone(&self.f);
+        let desc = Arc::clone(&self.desc);
         let in_progress_len = Arc::clone(&self.in_progress_len);
         // Spawn job thread
         thread::spawn(move || {
             // Lock until done
             let done_guard = done_lock.lock().expect("Progress lock poisoned");
             // Do work
-            let res = f(input.clone());
+            let res = desc.work(input.clone());
             // Remove job from in_progress
             in_progress.remove(&input);
             // Decrement in_progress_len
@@ -271,7 +306,7 @@ where
     }
 }
 
-impl<K, V, F> fmt::Debug for Outsourcer<K, V, F> {
+impl<K, V, D> fmt::Debug for Outsourcer<K, V, D> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Outsourcer")
             .field("in progress", &self.in_progress_len())
