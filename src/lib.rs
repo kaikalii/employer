@@ -109,25 +109,22 @@ impl<'a, K, V> From<Job<'a, K, V>> for Option<Guard<'a, K, V>> {
 }
 
 /// An interface for outsourcing work to other threads
-pub struct Outsourcer<K, V> {
+pub struct Outsourcer<K, V, F> {
     locks: Arc<Map<K, Arc<Mutex<()>>>>,
     in_progress: Arc<Set<K>>,
     finished: Arc<Map<K, V>>,
-    f: Arc<Box<dyn Fn(K) -> V + Send + Sync>>,
+    f: Arc<F>,
     in_progress_len: Arc<AtomicUsize>,
 }
 
-impl<K, V> Outsourcer<K, V> {
+impl<K, V, F> Outsourcer<K, V, F> {
     /// Create a new `Outsourcer` with the given function
-    pub fn new<F>(f: F) -> Self
-    where
-        F: Fn(K) -> V + Send + Sync + 'static,
-    {
+    pub fn new(f: F) -> Self {
         Outsourcer {
             locks: Arc::new(Map::new()),
             in_progress: Arc::new(Set::new()),
             finished: Arc::new(Map::new()),
-            f: Arc::new(Box::new(f)),
+            f: Arc::new(f),
             in_progress_len: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -183,10 +180,11 @@ impl<K, V> Outsourcer<K, V> {
     }
 }
 
-impl<K, V> Outsourcer<K, V>
+impl<K, V, F> Outsourcer<K, V, F>
 where
     K: Ord + Hash + Clone + Send + Sync + 'static,
     V: Send + Sync + 'static,
+    F: Fn(K) -> V + Send + Sync + 'static,
 {
     fn _start(&self, input: K) {
         // Create lock
@@ -258,9 +256,9 @@ where
     input has already finished, use
     [`Outsourcer::start`](struct.Outsourcer.html#method.start).
     */
-    pub fn restart_if<F>(&self, input: K, condition: F)
+    pub fn restart_if<G>(&self, input: K, condition: G)
     where
-        F: FnOnce(&V) -> bool,
+        G: FnOnce(&V) -> bool,
     {
         let restart = match self.get(&input) {
             Job::None => true,
@@ -273,7 +271,7 @@ where
     }
 }
 
-impl<K, V> fmt::Debug for Outsourcer<K, V> {
+impl<K, V, F> fmt::Debug for Outsourcer<K, V, F> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Outsourcer")
             .field("in progress", &self.in_progress_len())
