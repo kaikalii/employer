@@ -8,6 +8,7 @@ categories = [
     'concurrency',
     'data-structures',
 ]
+description = 'Spawn worker threads and check on them later'
 docs = 'docs.rs/employer'
 edition = '2018'
 homepage = 'https://github.com/kaikalii/employer'
