@@ -8,15 +8,15 @@ categories = [
     'concurrency',
     'data-structures',
 ]
-docs = 'docs.rs/outsource'
+docs = 'docs.rs/employer'
 edition = '2018'
-homepage = 'https://github.com/kaikalii/outsource'
+homepage = 'https://github.com/kaikalii/employer'
 keywords = [
     'thread',
     'work',
     'schedule',
 ]
 license = 'MIT'
-name = 'outsource'
+name = 'employer'
 readme = 'readme.md'
 version = '0.1.0'
